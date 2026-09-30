@@ -111,6 +111,35 @@ CREATE TABLE IF NOT EXISTS projection_revisions (
     batch         JSONB NOT NULL,
     PRIMARY KEY (projection_id, revision)
 );
+
+-- 正式修订关系变化追踪：仅成功的正式批次与产生修订号的推演并入在此落记录，
+-- 与断言落库、修订号递增同事务原子写入（失败批次 / 推演内编辑 / 无净变更并入
+-- 不产生记录）。同一地层对按编号固定顺序（stratum_a < stratum_b）只列一次。
+CREATE TABLE IF NOT EXISTS revision_changes (
+    revision     INTEGER NOT NULL,
+    seq          INTEGER NOT NULL,                       -- 页内稳定次序：地层对固定顺序
+    stratum_a    TEXT NOT NULL CHECK (stratum_a < stratum_b),
+    stratum_b    TEXT NOT NULL,
+    old_relation TEXT NOT NULL CHECK (old_relation IN ('same_period', 'earlier_than', 'later_than', 'undetermined')),
+    new_relation TEXT NOT NULL CHECK (new_relation IN ('same_period', 'earlier_than', 'later_than', 'undetermined')),
+    -- 当时的最优支撑证据路径；关系未定（含变为未定）时为空数组 []
+    old_path     JSONB NOT NULL,
+    new_path     JSONB NOT NULL,
+    -- formal_batch=正式断言批次；projection_merge=推演并入（历史回填时来源按审计还原）
+    source       TEXT NOT NULL CHECK (source IN ('formal_batch', 'projection_merge')),
+    PRIMARY KEY (revision, seq),
+    UNIQUE (revision, stratum_a, stratum_b)
+);
+CREATE INDEX IF NOT EXISTS idx_revision_changes_pair
+    ON revision_changes (stratum_a, stratum_b, revision);
+
+-- 修订封口标记：在线提交与启动回填都对已处理修订封口（含零变化修订），
+-- 保证回填幂等、不重复。
+CREATE TABLE IF NOT EXISTS revision_changes_sealed (
+    revision   INTEGER PRIMARY KEY,
+    source     TEXT NOT NULL,
+    sealed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
@@ -128,6 +157,10 @@ def init_pool(retries: int = 30, delay: float = 1.0) -> None:
                 with conn:
                     with conn.cursor() as cur:
                         cur.execute(SCHEMA)
+                        # 启动幂等回填部署前历史修订的变化记录（“已有历史修订也应可追溯”）
+                        from .changes import backfill_revision_changes
+
+                        backfill_revision_changes(cur)
             finally:
                 pool.putconn(conn)
             _pool = pool

@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import db, projections, service
+from . import changes, db, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
 from .models import BatchIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
@@ -19,14 +19,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
-        "并入时把相对基线的净变更应用于最新正式状态并重新核验。"
+        "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
+        "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）。"
     ),
     lifespan=lifespan,
 )
@@ -129,6 +130,24 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
     """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
     return service.query_relationship(a, b)
+
+
+# ------------------------------------------------------------------ 修订变化追踪
+@app.get("/revision-changes", tags=["changes"])
+def get_revision_changes(
+    limit: int = Query(default=100, ge=1, le=1000, description="每页条数（1-1000，默认 100）"),
+    cursor: Optional[str] = Query(default=None, description="分页游标；首次请求省略，后续原样回传"),
+):
+    """按正式修订游标分页追踪地层对关系结论与最优支撑路径的变化。
+
+    - 仅记录成功的正式断言批次与产生修订号的推演并入；
+    - 同一对按地层编号固定顺序（stratum_a < stratum_b）只列一次；
+    - 关系不变但最优支撑路径改变也列出；变为未定时路径为空数组；
+    - 旧侧路径按该修订提交前的当时状态解释（后来撤回的证据仍按生效处理）；
+    - 同一轮分页固定正式修订上界：首屏省略 cursor 固定 bound，后续原样回传
+      next_cursor，新并发提交不进入本轮窗口（不漏、不重、读不到半批）。
+    """
+    return changes.list_changes(limit, cursor)
 
 
 # ------------------------------------------------------------------ 定版

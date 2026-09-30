@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from psycopg2.extras import Json
 
 from .db import db_conn
+from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
 from .models import AssertOp, BatchIn, RetractOp
@@ -21,6 +22,11 @@ def _load_active(cur) -> List[Assertion]:
         "FROM assertions WHERE status = 'active' ORDER BY evidence_id"
     )
     return [Assertion(evidence_id=r[0], a=r[1], b=r[2], relation=r[3]) for r in cur.fetchall()]
+
+
+def _load_strata(cur) -> List[str]:
+    cur.execute("SELECT stratum_id FROM strata ORDER BY stratum_id")
+    return [r[0] for r in cur.fetchall()]
 
 
 def _ensure_strata(cur, *stratum_ids: str) -> None:
@@ -84,6 +90,9 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
                 )
             new_revision = current + 1
 
+            # 变化追踪旧侧：本批次应用前的当时生效断言集（后来撤回的证据在旧侧仍生效）
+            before_assertions = _load_active(cur)
+
             for op in batch.operations:
                 if isinstance(op, AssertOp):
                     _ensure_strata(cur, op.stratum_a, op.stratum_b)
@@ -127,7 +136,8 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
                     )
 
             # 对整批应用后的最终关系核验
-            derivation = Derivation(_load_active(cur))
+            after_assertions = _load_active(cur)
+            derivation = Derivation(after_assertions)
             conflicts = derivation.validate()
             if conflicts:
                 raise ApiError(
@@ -137,12 +147,16 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
                     {"conflicts": conflicts},
                 )
 
+            # 关系变化追踪：按提交前/后的当时状态逐对比较，与修订号同事务原子落库
+            diffs = relation_diffs(_load_strata(cur), before_assertions, after_assertions)
+
             cur.execute("UPDATE revision_counter SET revision = %s WHERE id = TRUE", (new_revision,))
             cur.execute(
                 "INSERT INTO revisions (revision, batch) VALUES (%s, %s)",
                 (new_revision, Json(batch.model_dump())),
             )
-            return {"revision": new_revision, "applied": len(batch.operations)}
+            insert_revision_changes(cur, new_revision, diffs, "formal_batch")
+            return {"revision": new_revision, "applied": len(batch.operations), "relation_changes": len(diffs)}
 
 
 # ------------------------------------------------------------------ 查询

@@ -72,6 +72,30 @@ def main() -> None:
         requests.get(f"{BASE}/snapshots/{version}/relationship", params={"a": "L1", "b": "L3"}),
     )
 
+    # 7. 正式修订关系变化追踪：游标分页整轮读取
+    print("\n== 正式修订关系变化追踪（游标分页） ==")
+    cursor = None
+    bound = None
+    total = 0
+    while True:
+        params = {"limit": 2}  # 每页条数（1-1000）
+        if cursor:
+            params["cursor"] = cursor  # 原样回传服务端下发的 next_cursor
+        body = requests.get(f"{BASE}/revision-changes", params=params).json()
+        bound = body["bound_revision"]  # 本轮固定的正式修订上界
+        for ch in body["changes"]:
+            total += 1
+            print(
+                f"  修订{ch['revision']} [{ch['stratum_a']}/{ch['stratum_b']}] "
+                f"{ch['old_relation_label']} -> {ch['new_relation_label']}  "
+                f"旧路径={ch['old_evidence_path']} 新路径={ch['new_evidence_path']}  "
+                f"来源={ch['source']}"
+            )
+        cursor = body["next_cursor"]
+        if not cursor:
+            break
+    print(f"本轮上界修订={bound}，共 {total} 条变化（has_more=false 表示本轮读完）")
+
 
 if __name__ == "__main__":
     try:

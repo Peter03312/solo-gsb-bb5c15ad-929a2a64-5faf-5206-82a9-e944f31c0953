@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from psycopg2.extras import Json
 
 from .db import db_conn
+from .changes import insert_revision_changes, relation_diffs
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
 from .models import AssertOp, ProjectionBatchIn, RetractOp
@@ -597,6 +598,11 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
                     "net_changes": {"added": [], "retracted": [], "count": 0},
                 }
 
+            # 关系变化追踪：并入前 formal=旧侧当时状态，merged_assertions=新侧状态
+            cur.execute("SELECT stratum_id FROM strata ORDER BY stratum_id")
+            formal_strata = [r[0] for r in cur.fetchall()]
+            diffs = relation_diffs(formal_strata, formal, merged_assertions)
+
             # ---- 作为一次正式批次原子提交 ----
             new_revision = current + 1
             operations: List[Dict[str, Any]] = []
@@ -638,9 +644,11 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
                     ),
                 ),
             )
+            # 变化记录与并入提交同事务原子写入
+            insert_revision_changes(cur, new_revision, diffs, "projection_merge")
             cur.execute(
-                "UPDATE projections SET status = 'merged', closed_at = now(), merged_into_revision = %s "
-                "WHERE id = %s",
+                "UPDATE projections SET status = 'merged', closed_at = now(), "
+                "merged_into_revision = %s WHERE id = %s",
                 (new_revision, projection_id),
             )
             return {
@@ -649,6 +657,7 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
                 "applied": change_count,
                 "revision": new_revision,
                 "revision_incremented": True,
+                "relation_changes": len(diffs),
                 "net_changes": {
                     "added": [
                         {
