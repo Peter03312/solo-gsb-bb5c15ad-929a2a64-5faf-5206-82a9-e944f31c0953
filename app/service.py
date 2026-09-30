@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from psycopg2.extras import Json
 
+from .changes import record_revision_changes
 from .db import db_conn
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
@@ -138,6 +139,8 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
                 )
 
             cur.execute("UPDATE revision_counter SET revision = %s WHERE id = TRUE", (new_revision,))
+            # 同事务物化本修订的关系结论变化（供 /changes 分页追踪；失败回滚则不产生记录）
+            record_revision_changes(cur, new_revision)
             cur.execute(
                 "INSERT INTO revisions (revision, batch) VALUES (%s, %s)",
                 (new_revision, Json(batch.model_dump())),

@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import db, projections, service
+from . import changes, db, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
 from .models import BatchIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
@@ -19,14 +19,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
-        "并入时把相对基线的净变更应用于最新正式状态并重新核验。"
+        "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
+        "支持按正式修订追踪关系结论及支撑证据路径的变化（稳定游标分页）。"
     ),
     lifespan=lifespan,
 )
@@ -57,15 +58,19 @@ def index():
 # ------------------------------------------------------------------ 地层
 @app.post("/strata", status_code=201, tags=["strata"])
 def create_stratum(body: StratumIn):
-    """登记遗址地层。"""
+    """登记遗址地层。记录登记时的正式修订号（供变化追踪重建历史地层集合）。"""
     with db.db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM strata WHERE stratum_id = %s", (body.stratum_id,))
             if cur.fetchone() is not None:
                 raise ApiError(409, "STRATUM_EXISTS", f"地层已登记: {body.stratum_id}", {"stratum_id": body.stratum_id})
+            # 锁定修订计数器，使地层登记与批次提交串行，
+            # added_revision 精确对应登记生效时的正式修订号
+            cur.execute("SELECT revision FROM revision_counter WHERE id = TRUE FOR UPDATE")
+            revision = cur.fetchone()[0]
             cur.execute(
-                "INSERT INTO strata (stratum_id, site) VALUES (%s, %s)",
-                (body.stratum_id, body.site),
+                "INSERT INTO strata (stratum_id, site, added_revision) VALUES (%s, %s, %s)",
+                (body.stratum_id, body.site, revision),
             )
     return {"stratum_id": body.stratum_id, "site": body.site}
 
@@ -129,6 +134,25 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
     """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
     return service.query_relationship(a, b)
+
+
+# ------------------------------------------------------------------ 修订变化追踪
+@app.get("/changes", tags=["changes"])
+def get_changes(
+    cursor: Optional[str] = Query(
+        default=None,
+        description="分页游标：首轮不传（固定当前正式修订号为本轮上界），后续传上一页返回的 next_cursor",
+    ),
+    limit: int = Query(default=50, ge=1, le=500, description="每页条数"),
+):
+    """按正式修订追踪关系结论及支撑证据路径的变化。
+
+    每次成功的正式批次 / 有净变更的推演并入产生正式修订 N 时，记录修订 N-1 -> N
+    间关系结论或最优证据路径发生变化的地层对（同一对按编号固定顺序只列一次，
+    变为未定时路径为空，旧侧证据按当时状态解释）。稳定游标分页：同一轮固定
+    正式修订上界，并发提交不漏项、不重复、不读半批。
+    """
+    return changes.list_changes(cursor=cursor, limit=limit)
 
 
 # ------------------------------------------------------------------ 定版

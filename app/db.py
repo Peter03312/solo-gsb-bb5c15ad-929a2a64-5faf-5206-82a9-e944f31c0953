@@ -15,6 +15,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS strata (
     stratum_id  TEXT PRIMARY KEY,
     site        TEXT,
+    -- 登记时的正式修订号，供变化追踪重建历史地层集合（历史数据迁移记 0）
+    added_revision INTEGER,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -42,6 +44,25 @@ CREATE TABLE IF NOT EXISTS revisions (
     revision   INTEGER PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     batch      JSONB NOT NULL
+);
+
+-- 每次正式修订的关系结论变化：按地层对一行（同一对按编号固定顺序只存一次），
+-- 与产生该修订的批次在同一事务写入，分页读取不会看到半批结果；
+-- 路径为 NULL 表示该侧未定（undetermined）
+CREATE TABLE IF NOT EXISTS revision_changes (
+    revision     INTEGER NOT NULL,
+    stratum_a    TEXT NOT NULL,
+    stratum_b    TEXT NOT NULL,
+    old_relation TEXT NOT NULL CHECK (old_relation IN ('same_period', 'earlier_than', 'later_than', 'undetermined')),
+    old_path     JSONB,
+    new_relation TEXT NOT NULL CHECK (new_relation IN ('same_period', 'earlier_than', 'later_than', 'undetermined')),
+    new_path     JSONB,
+    PRIMARY KEY (revision, stratum_a, stratum_b)
+);
+
+-- 已计算变化记录的正式修订标记（区分“无净变化”与“尚未计算”，支持历史修订回填）
+CREATE TABLE IF NOT EXISTS revision_change_marks (
+    revision INTEGER PRIMARY KEY
 );
 
 -- 定版：不可变关系快照。结论行一旦写入永不修改、永不删除
@@ -111,6 +132,10 @@ CREATE TABLE IF NOT EXISTS projection_revisions (
     batch         JSONB NOT NULL,
     PRIMARY KEY (projection_id, revision)
 );
+
+-- ---- 迁移（幂等）：历史库 strata 补充 added_revision 列，已有行记 0（视为自始已登记） ----
+ALTER TABLE strata ADD COLUMN IF NOT EXISTS added_revision INTEGER;
+UPDATE strata SET added_revision = 0 WHERE added_revision IS NULL;
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None

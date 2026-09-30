@@ -1,7 +1,8 @@
 # 考古地层关系核验服务
 
 基于 **Python (FastAPI) + PostgreSQL** 的考古地层关系核验服务。登记遗址地层与带唯一证据编号的
-“同一期 / 早于”断言，自动推导地层间关系，支持批次原子核验、冲突证据路径定位、关系查询与不可变定版快照。
+“同一期 / 早于”断言，自动推导地层间关系，支持批次原子核验、冲突证据路径定位、关系查询、不可变定版快照，
+以及按正式修订追踪关系结论与支撑证据路径的变化。
 
 ## 语义规则
 
@@ -20,6 +21,10 @@
   **相对基线的净变更**应用于最新正式状态并重新核验：基线目标已撤回 / 编号已被正式占用 /
   关系冲突（附证据路径）时返回具体原因且双方不变；通过则作为一次正式批次原子提交并关闭推演；
   净变更为空时只关闭推演，不递增正式修订号。
+- **变化追踪**：每次成功正式批次 / 有净变更的推演并入产生正式修订 N 时，在同一事务内记录
+  修订 N-1 → N 间关系结论或最优证据路径发生变化的地层对（同一对按编号固定顺序只记一次，
+  变为未定时路径为空）；失败批次、推演内编辑、无净变更并入不产生记录；
+  `GET /changes` 以稳定游标分页读取，同一轮分页固定正式修订上界。
 
 ## 快速开始
 
@@ -60,6 +65,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/revision` | 当前修订号 |
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| GET | `/changes?limit=&cursor=` | 正式修订间关系结论及证据路径变化（稳定游标分页） |
 | POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
 | GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
 | GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论 |
@@ -125,6 +131,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | HTTP | code | 含义 |
 | --- | --- | --- |
 | 400 | `INVALID_STRATUM` | 引用了未登记的地层 |
+| 400 | `INVALID_CURSOR` | 分页游标无效或已损坏 |
 | 409 | `STALE_REVISION` | 批次携带的修订号过期（响应含当前修订号） |
 | 409 | `DUPLICATE_EVIDENCE` | 证据编号重复（含已撤回的编号） |
 | 409 | `ASSERTION_NOT_FOUND` | 撤回不存在或已撤回的断言 |
@@ -202,6 +209,81 @@ curl -X POST "$BASE/projections/1/merge"
 bash examples/projection_demo.sh
 ```
 
+## 修订变化追踪（GET /changes）
+
+考古人员可按正式修订追踪关系结论及支撑证据的变化。每次**成功的正式断言批次**与
+**有净变更的推演并入**产生正式修订 `N` 时，服务在**同一事务**内计算并物化修订
+`N-1 → N` 之间发生变化的地层对：
+
+- 同一地层对按编号固定顺序（字典序，`stratum_a < stratum_b`）只记录一次；
+- **关系不变但最优支撑路径改变**同样记录；
+- 变为 `undetermined`（未定）时该侧 `evidence_path` 为 `null`、`path_detail` 为空；
+- 旧侧证据按**当时状态**解释：后来撤回的证据在旧侧 `path_detail` 中仍显示 `active`；
+- 失败批次、推演内编辑、无净变更并入不递增正式修订号，**不产生变化记录**；
+- 历史修订（本功能上线前已存在）在首次查询时按断言的 `added_revision / retracted_revision`
+  自动重建当时状态并回填，同样可追溯（历史地层登记的修订号无法考证，迁移时记 0，视为自始已登记；
+  新登记地层记录登记时的正式修订号）。
+
+### 分页与并发语义
+
+- 首轮请求不带 `cursor`：服务固定**当前正式修订号**为本轮上界（响应含 `max_revision`）；
+- 后续页携带上一页返回的 `next_cursor`：同一轮分页沿用同一上界，并发提交产生的新修订
+  不影响本轮结果（不漏项、不重复）；`next_cursor` 为 `null` 表示本轮读完，
+  再次以无游标请求即开启新一轮（含此后新修订）；
+- 变化记录与产生它的批次在**同一事务**提交，任何时刻都不会读到半批结果；
+- 游标为不透明字符串（内含上界与位置），请勿自行构造；非法游标返回 400 `INVALID_CURSOR`。
+
+### 响应示例
+
+```bash
+curl "$BASE/changes?limit=2"
+# 翻页
+curl "$BASE/changes?limit=2&cursor=<上一页返回的 next_cursor>"
+```
+
+```json
+{
+  "max_revision": 5,
+  "changes": [
+    {
+      "revision": 5,
+      "stratum_a": "C1",
+      "stratum_b": "C3",
+      "old": {
+        "relation": "earlier_than",
+        "relation_label": "早于",
+        "evidence_path": ["EV-C01"],
+        "path_detail": [
+          {"evidence_id": "EV-C01", "stratum_a": "C1", "stratum_b": "C3",
+           "relation": "earlier_than", "status": "active"}
+        ]
+      },
+      "new": {
+        "relation": "earlier_than",
+        "relation_label": "早于",
+        "evidence_path": ["EV-C02", "EV-C03"],
+        "path_detail": [
+          {"evidence_id": "EV-C02", "stratum_a": "C1", "stratum_b": "C2",
+           "relation": "earlier_than", "status": "active"},
+          {"evidence_id": "EV-C03", "stratum_a": "C2", "stratum_b": "C3",
+           "relation": "earlier_than", "status": "active"}
+        ]
+      }
+    }
+  ],
+  "next_cursor": "eyJtYXhfcmV2aXNpb24iOjUsImxhc3QiOls1LCJDMSIsIkMzIl19"
+}
+```
+
+上例即“关系不变但最优支撑路径改变”：修订 5 撤回了直接证据 EV-C01，C1 与 C3 仍为早于，
+最优路径改走 EV-C02 + EV-C03；旧侧 EV-C01 虽已撤回，仍按当时状态显示 `active`。
+
+端到端演示（新增结论、路径变化、变为未定、失败批次/空净变更并入无记录、稳定游标分页）：
+
+```bash
+bash examples/changes_demo.sh
+```
+
 ## 调用示例
 
 端到端 curl 演示（覆盖登记、批次、推导查询、冲突拒绝、撤回、定版与旧版不可变）：
@@ -215,6 +297,12 @@ bash examples/demo.sh
 
 ```bash
 bash examples/projection_demo.sh
+```
+
+修订变化追踪端到端演示（按正式修订追踪结论与证据路径变化、稳定游标分页）：
+
+```bash
+bash examples/changes_demo.sh
 ```
 
 Python 客户端示例：
@@ -231,12 +319,14 @@ app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
+  changes.py      # 修订变化追踪：变化计算与物化、历史回填、稳定游标分页
   derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径
   db.py           # 连接池与模式初始化（启动时自动建表）
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
+  changes_demo.sh    # 修订变化追踪示例（结论/路径变化、稳定游标分页）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml

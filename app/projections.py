@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from psycopg2.extras import Json
 
+from .changes import record_revision_changes
 from .db import db_conn
 from .derivation import Assertion, Derivation, RELATION_LABELS
 from .errors import ApiError
@@ -624,6 +625,8 @@ def merge_projection(projection_id: int) -> Dict[str, Any]:
                 operations.append({"op": "retract", "evidence_id": r["evidence_id"]})
 
             cur.execute("UPDATE revision_counter SET revision = %s WHERE id = TRUE", (new_revision,))
+            # 同事务物化本修订的关系结论变化（与正式批次同一语义）
+            record_revision_changes(cur, new_revision)
             cur.execute(
                 "INSERT INTO revisions (revision, batch) VALUES (%s, %s)",
                 (
